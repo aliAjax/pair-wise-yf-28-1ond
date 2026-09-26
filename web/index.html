@@ -1,4 +1,299 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>临床试验随机化与安全暂停</title>
+<style>
+  :root{--line:#cbd2dc}
+  *{box-sizing:border-box}
+  body{font:15px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1040px;margin:24px auto;padding:0 16px;color:#1f2933}
+  h1{font-size:22px} h2{font-size:17px;margin:0 0 10px} h3{font-size:15px;margin:18px 0 8px}
+  .panel{border:1px solid var(--line);border-radius:10px;padding:16px;margin:14px 0;background:#fff}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  label{font-size:13px;color:#52606d}
+  select,input,textarea,button{font:inherit;padding:7px 10px;border:1px solid #9aa5b1;border-radius:6px;background:#fff}
+  textarea{width:100%;min-height:64px;resize:vertical}
+  button{cursor:pointer}
+  button.primary{background:#2b6cb0;color:#fff;border-color:#2b6cb0}
+  button.danger{background:#c53030;color:#fff;border-color:#c53030}
+  button.ok{background:#2f855a;color:#fff;border-color:#2f855a}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:600}
+  .b-running{background:#c6f6d5;color:#22543d}.b-paused{background:#fed7d7;color:#742a2a}
+  .b-draft{background:#e2e8f0;color:#334155}.b-stopped{background:#cbd5e0;color:#1a202c}
+  .s-enrolled{background:#bee3f8;color:#2a4365}.b-completed{background:#c6f6d5;color:#22543d}.b-withdrawn{background:#feebc8;color:#7b341e}
+  .banner{border:1px solid #fc8181;background:#fff5f5;color:#742a2a;border-radius:8px;padding:10px 14px;margin:10px 0}
+  .banner b{color:#c53030}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{border:1px solid #e2e8f0;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#f7fafc}
+  .muted{color:#64748b;font-size:12px}
+  #msg{min-height:20px;margin:8px 0;font-size:14px}
+  #msg.ok{color:#2f855a} #msg.err{color:#c53030}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  pre.detail{background:#f4f6f8;padding:10px;border-radius:8px;white-space:pre-wrap;font-size:12px;max-height:340px;overflow:auto}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>临床试验随机分配、安全暂停与盲法管理</h1>
+
+<div class="panel">
+  <div class="row">
+    <label>当前用户
+      <select id="user"><option value="site1">site1（中心一）</option><option value="site2">site2（中心二）</option>
+      <option value="coord">coord（协调员）</option><option value="monitor1">monitor1（监查员甲）</option>
+      <option value="monitor2">monitor2（监查员乙）</option></select>
+    </label>
+    <label>试验 ID <input id="trial" value="1" style="width:70px"></label>
+    <button class="primary" onclick="loadAll()">刷新</button>
+    <span id="trialHead" class="muted"></span>
+  </div>
+  <div id="msg"></div>
+  <div id="holdBanner"></div>
+</div>
+
+<div id="coordPanel" class="panel" hidden>
+  <h2>协调员：入组暂停 / 恢复</h2>
+  <div class="grid2">
+    <div>
+      <h3>出现安全信号 → 暂停入组</h3>
+      <p class="muted">暂停后新受试者无法分配编号；已入组受试者可继续随访、登记完成/退出和申请揭盲。</p>
+      <textarea id="pauseReason" placeholder="填写暂停原因（安全信号描述，至少 8 字）"></textarea>
+      <button class="danger" onclick="pauseTrial()">暂停入组</button>
+    </div>
+    <div>
+      <h3>整改结束 → 补写处理说明并恢复</h3>
+      <p class="muted">恢复后接着原有随机序列发放编号，已占用的随机编号不回收。</p>
+      <textarea id="resumeNote" placeholder="填写整改与处理说明（至少 8 字）"></textarea>
+      <button class="ok" onclick="resumeTrial()">恢复入组</button>
+    </div>
+  </div>
+</div>
+
+<div id="sitePanel" class="panel" hidden>
+  <h2>中心操作</h2>
+  <div id="enrollBox">
+    <h3>新受试者入组申请</h3>
+    <div class="row" id="factorInputs">
+      <label>外部受试者编号 <input id="externalId" placeholder="如 S001-010"></label>
+    </div>
+    <div style="margin-top:8px"><button class="primary" onclick="enroll()">申请随机编号</button>
+      <span id="enrollHint" class="muted"></span></div>
+  </div>
+  <h3>本中心受试者</h3>
+  <table id="participantTable"><thead><tr>
+    <th>受试者编号</th><th>分配编号</th><th>状态</th><th>变更原因 / 时间</th><th>操作</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+
+<div id="monitorPanel" class="panel" hidden>
+  <h2>监查员：揭盲双人审批</h2>
+  <table id="requestTable"><thead><tr>
+    <th>#</th><th>试验</th><th>受试者</th><th>中心</th><th>原因</th><th>申请人</th><th>状态</th><th>操作</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+
+<div class="panel">
+  <h2>暂停 / 恢复记录</h2>
+  <table id="holdTable"><thead><tr>
+    <th>#</th><th>状态</th><th>暂停原因</th><th>暂停人 / 时间</th><th>整改处理说明</th><th>恢复人 / 时间</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+
+<div class="panel">
+  <h2>变更记录（审计日志）</h2>
+  <pre id="auditLog" class="detail"></pre>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let summary = null;
+
+function role(){
+  const u=$("#user").value;
+  return u==="coord"?"coordinator":u.startsWith("monitor")?"monitor":"site";
+}
+function trialId(){return parseInt($("#trial").value,10);}
+function setMsg(text, ok){ const m=$("#msg"); m.textContent=text; m.className=ok?"ok":"err"; }
+
+async function api(path, opts={}){
+  const r=await fetch(path,Object.assign({headers:{"X-User-Id":$("#user").value}},opts));
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(data.error?.message||"请求失败"),{data});
+  return data;
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function badge(status){
+  const map={running:["b-running","入组中"],paused:["b-paused","已暂停"],draft:["b-draft","草稿"],stopped:["b-stopped","已停止"],
+    enrolled:["s-enrolled","在组"],completed:["b-completed","已完成"],withdrawn:["b-withdrawn","已退出"],
+    pending:["s-enrolled","待审批"],approved:["b-completed","已批准"],rejected:["b-withdrawn","已拒绝"]};
+  const [cls,txt]=map[status]||["b-dast",status];
+  return `<span class="badge ${cls}">${txt}</span>`;
+}
+
+async function loadAll(){
+  setMsg("",true);
+  try{
+    summary=await api(`/api/trials/${trialId()}/summary`);
+    renderSummary();
+    if(role()==="site") await loadParticipants();
+    if(role()==="monitor") await loadRequests();
+  }catch(e){
+    summary=null; renderSummary();
+    setMsg(e.data?.error?.code==="not_found"?"试验不存在，请先由协调员创建":e.message);
+    $("#auditLog").textContent="";
+  }
+}
+
+function renderSummary(){
+  const r=role();
+  $("#coordPanel").hidden=r!=="coordinator";
+  $("#monitorPanel").hidden=r!=="monitor";
+  $("#sitePanel").hidden=r!=="site";
+  const tb=$("#holdTable tbody"); tb.innerHTML="";
+  $("#auditLog").textContent="";
+  $("#holdBanner").innerHTML=""; $("#trialHead").textContent="";
+  if(!summary) return;
+  const t=summary.trial;
+  $("#trialHead").innerHTML=`&nbsp; ${esc(t.name)}（方案 ${esc(t.protocol_version)}） ${badge(t.status)}`;
+  if(t.status==="paused" && summary.enrollment_hold){
+    const h=summary.enrollment_hold;
+    $("#holdBanner").innerHTML=`<div class="banner"><b>当前阻断原因：${esc(h.reason)}</b><br>
+      入组已暂停（${esc(h.paused_by)} 于 ${esc(h.paused_at)}）。新受试者申请会被拒绝；已入组受试者仍可完成随访、登记完成/退出和申请揭盲。</div>`;
+  }
+  // 动态生成分层因素输入
+  const factors=t.strata_factors||[];
+  const box=$("#factorInputs");
+  box.innerHTML=`<label>外部受试者编号 <input id="externalId" placeholder="如 S001-010"></label>` +
+    factors.map(f=>`<label>${esc(f)} <input class="factor" data-factor="${esc(f)}" placeholder="${esc(f)}值"></label>`).join("");
+  $("#enrollHint").textContent = t.status==="paused" ? "（入组暂停中，申请将返回阻断原因）" : "";
+
+  for(const h of summary.hold_history){
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${h.id}</td><td>${h.active?badge("paused"):badge("running")}</td>
+      <td>${esc(h.reason)}</td><td>${esc(h.paused_by)}<br><span class="muted">${esc(h.paused_at)}</span></td>
+      <td>${esc(h.resolution_note||"—")}</td>
+      <td>${h.resumed_by?esc(h.resumed_by)+'<br><span class="muted">'+esc(h.resumed_at)+'</span>':"—"}</td>`;
+    tb.appendChild(tr);
+  }
+  if(!summary.hold_history.length) tb.innerHTML=`<tr><td colspan="6" class="muted">暂无暂停记录</td></tr>`;
+  const actionName={
+    "trial.create":"创建试验","trial.start":"开始入组","enrollment.pause":"暂停入组","enrollment.resume":"恢复入组",
+    "participant.enroll":"受试者入组","participant.completed":"登记完成","participant.withdrawn":"登记退出",
+    "unblinding.request":"申请揭盲","unblinding.approve.first":"揭盲一审","unblinding.approve.second":"揭盲二审",
+    "protocol.update":"方案修改"
+  };
+  const visible = summary.audit;
+  $("#auditLog").textContent = visible.map(a=>
+    `${a.created_at}  [${actionName[a.action]||a.action}]  ${a.actor_id}\n  ${JSON.stringify(a.detail)}`
+  ).join("\n") || "暂无记录";
+}
+
+async function loadParticipants(){
+  const data=await api(`/api/trials/${trialId()}/participants`);
+  const tb=$("#participantTable tbody"); tb.innerHTML="";
+  for(const p of data.items){
+    const tr=document.createElement("tr");
+    const ops = p.status==="enrolled"
+      ? `<button onclick="setStatus(${p.id},'completed')">登记完成</button>
+         <button onclick="setStatus(${p.id},'withdrawn')">登记退出</button>
+         <button onclick="requestUnblind(${p.id})">申请揭盲</button>`
+      : `<button onclick="requestUnblind(${p.id})">申请揭盲</button>`;
+    tr.innerHTML=`<td>${esc(p.external_id)}</td><td>${esc(p.allocation_code)}</td><td>${badge(p.status)}</td>
+      <td>${p.status_reason?esc(p.status_reason)+"<br><span class='muted'>"+esc(p.status_changed_by)+" · "+esc(p.status_changed_at)+"</span>":"—"}</td>
+      <td class="row">${ops}</td>`;
+    tb.appendChild(tr);
+  }
+  if(!data.items.length) tb.innerHTML=`<tr><td colspan="5" class="muted">本中心暂无受试者</td></tr>`;
+}
+
+async function loadRequests(){
+  const data=await api("/api/unblinding-requests");
+  const tb=$("#requestTable tbody"); tb.innerHTML="";
+  for(const q of data.items){
+    const canApprove = q.status==="pending" && q.first_approver!==$("#user").value;
+    const trHtml=`<td>${q.id}</td><td>${q.trial_id}</td><td>${esc(q.external_id)}</td><td>${esc(q.site_id)}</td>
+      <td>${esc(q.reason)}</td><td>${esc(q.requester_id)}</td><td>${badge(q.status)}
+        <div class="muted">${q.first_approver?("一审:"+esc(q.first_approver)):""} ${q.second_approver?("二审:"+esc(q.second_approver)):""}</div></td>
+      <td>${canApprove?'<button class="primary" onclick="approve('+q.id+')">审批</button>':"—"}</td>`;
+    const tr=document.createElement("tr"); tr.innerHTML=trHtml; tb.appendChild(tr);
+  }
+  if(!data.items.length) tb.innerHTML=`<tr><td colspan="8" class="muted">暂无揭盲申请</td></tr>`;
+}
+
+async function enroll(){
+  const ext=$("#externalId").value.trim();
+  if(!ext){setMsg("请填写外部受试者编号");return;}
+  const factors={};
+  document.querySelectorAll("input.factor").forEach(i=>factors[i.dataset.factor]=i.value.trim());
+  try{
+    const p=await api(`/api/trials/${trialId()}/enroll`,{method:"POST",
+      headers:{"X-User-Id":$("#user").value,"Content-Type":"application/json"},
+      body:JSON.stringify({external_id:ext,factors})});
+    setMsg(p.idempotent?`编号已存在（幂等返回），分配编号：${p.allocation_code}`:`入组成功，分配编号：${p.allocation_code}（分组对中心隐藏）`,true);
+    await loadAll();
+  }catch(e){
+    const err=e.data.error;
+    if(err.code==="enrollment_paused" && err.details){
+      setMsg(`已阻断：${err.message}。暂停原因「${err.details.reason}」（${err.details.paused_by} 于 ${err.details.paused_at}）`);
+    }else setMsg(err.message);
+  }
+}
+
+async function pauseTrial(){
+  const reason=$("#pauseReason").value.trim();
+  if(reason.length<8){setMsg("请填写至少 8 字的暂停原因");return;}
+  try{
+    await api(`/api/trials/${trialId()}/pause`,{method:"POST",
+      headers:{"X-User-Id":$("#user").value,"Content-Type":"application/json"},body:JSON.stringify({reason})});
+    $("#pauseReason").value=""; setMsg("入组已暂停，已入组受试者随访与揭盲不受影响",true); await loadAll();
+  }catch(e){setMsg(e.data.error.message);}
+}
+async function resumeTrial(){
+  const note=$("#resumeNote").value.trim();
+  if(note.length<8){setMsg("请补写至少 8 字的整改处理说明");return;}
+  try{
+    await api(`/api/trials/${trialId()}/resume`,{method:"POST",
+      headers:{"X-User-Id":$("#user").value,"Content-Type":"application/json"},body:JSON.stringify({resolution_note:note})});
+    $("#resumeNote").value=""; setMsg("入组已恢复，将继续沿用原有随机序列",true); await loadAll();
+  }catch(e){setMsg(e.data.error.message);}
+}
+
+async function setStatus(id,status){
+  const reason=prompt(`登记${status==="completed"?"完成":"退出"}原因（至少 4 字）：`);
+  if(reason===null) return;
+  if(reason.trim().length<4){setMsg("原因至少 4 字");return;}
+  try{
+    await api(`/api/participants/${id}/status`,{method:"POST",
+      headers:{"X-User-Id":$("#user").value,"Content-Type":"application/json"},
+      body:JSON.stringify({status,reason:reason.trim()})});
+    setMsg("状态已登记，随机编号保持占用、不回收",true); await loadAll();
+  }catch(e){setMsg(e.data.error.message);}
+}
+async function requestUnblind(id){
+  const reason=prompt("揭盲原因（至少 8 字）：");
+  if(reason===null) return;
+  if(reason.trim().length<8){setMsg("揭盲原因至少 8 字");return;}
+  try{
+    await api(`/api/participants/${id}/unblinding-requests`,{method:"POST",
+      headers:{"X-User-Id":$("#user").value,"Content-Type":"application/json"},
+      body:JSON.stringify({reason:reason.trim()})});
+    setMsg("揭盲申请已提交，等待两名监查员/协调员独立审批",true);
+  }catch(e){setMsg(e.data.error.message);}
+}
+async function approve(id){
+  try{
+    const r=await api(`/api/unblinding-requests/${id}/approve`,{method:"POST",
+      headers:{"X-User-Id":$("#user").value}});
+    setMsg(r.second_approval_required?"一审完成，还需另一人二审":`二审通过，该受试者分组为：${r.arm}`,true);
+    await loadAll();
+  }catch(e){setMsg(e.data.error.message);}
+}
+
+$("#user").addEventListener("change",loadAll);
+loadAll();
+</script>
+</body>
+</html>

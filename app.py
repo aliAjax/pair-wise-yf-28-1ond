@@ -18,9 +18,9 @@ MAX_ARM_LENGTH = 40
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now():
@@ -51,7 +51,7 @@ class RandomizationStore:
                 CREATE TABLE IF NOT EXISTS trials(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
                     protocol_version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
-                        CHECK(status IN ('draft','running','stopped')),
+                        CHECK(status IN ('draft','running','paused','stopped')),
                     arms_json TEXT NOT NULL, strata_factors_json TEXT NOT NULL,
                     block_size INTEGER NOT NULL CHECK(block_size >= 2),
                     seed TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
@@ -80,7 +80,15 @@ class RandomizationStore:
                     allocation_code TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'enrolled'
                         CHECK(status IN ('enrolled','withdrawn','completed')),
                     enrolled_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+                    status_reason TEXT, status_changed_at TEXT, status_changed_by TEXT REFERENCES users(id),
                     UNIQUE(trial_id,external_id)
+                );
+                CREATE TABLE IF NOT EXISTS enrollment_holds(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    reason TEXT NOT NULL, paused_by TEXT NOT NULL REFERENCES users(id),
+                    paused_at TEXT NOT NULL,
+                    resolution_note TEXT, resumed_by TEXT REFERENCES users(id), resumed_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS unblinding_requests(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,6 +105,38 @@ class RandomizationStore:
                 );
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn):
+        """把早于“暂停入组”功能的数据库升级到当前结构。"""
+        pragma = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='trials'"
+        ).fetchone()[0]
+        if "'paused'" not in pragma:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute(
+                """
+                CREATE TABLE trials_new(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                    protocol_version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
+                        CHECK(status IN ('draft','running','paused','stopped')),
+                    arms_json TEXT NOT NULL, strata_factors_json TEXT NOT NULL,
+                    block_size INTEGER NOT NULL CHECK(block_size >= 2),
+                    seed TEXT NOT NULL, created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL, started_at TEXT
+                )"""
+            )
+            conn.execute(
+                "INSERT INTO trials_new SELECT id,name,protocol_version,status,arms_json,strata_factors_json,block_size,seed,created_by,created_at,started_at FROM trials"
+            )
+            conn.execute("DROP TABLE trials")
+            conn.execute("ALTER TABLE trials_new RENAME TO trials")
+            conn.execute("PRAGMA foreign_keys=ON")
+        pcols = {r["name"] for r in conn.execute("PRAGMA table_info(participants)").fetchall()}
+        if "status_reason" not in pcols:
+            conn.execute("ALTER TABLE participants ADD COLUMN status_reason TEXT")
+            conn.execute("ALTER TABLE participants ADD COLUMN status_changed_at TEXT")
+            conn.execute("ALTER TABLE participants ADD COLUMN status_changed_by TEXT REFERENCES users(id)")
 
     def seed(self):
         self.init_schema()
@@ -201,6 +241,77 @@ class RandomizationStore:
             self._audit(conn, trial_id, user_id, "trial.start", {})
             return {"id": trial_id, "status": "running"}
 
+    @staticmethod
+    def _reason(value, label, minimum=8):
+        text = str(value or "").strip()
+        if len(text) < minimum:
+            raise BusinessError(f"{label}至少 {minimum} 字", 422, "reason_required")
+        if len(text) > 1000:
+            raise BusinessError(f"{label}不能超过 1000 字", 422, "reason_too_long")
+        return text
+
+    def pause_enrollment(self, user_id, trial_id, reason):
+        """出现安全信号后暂停入组：已入组受试者的随访与揭盲不受影响。"""
+        reason = self._reason(reason, "暂停原因")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "running":
+                    raise BusinessError("只有入组中的试验可以暂停", 409, "invalid_status")
+                ts = now()
+                cur = conn.execute(
+                    "INSERT INTO enrollment_holds(trial_id,reason,paused_by,paused_at) VALUES(?,?,?,?)",
+                    (trial_id, reason, user_id, ts),
+                )
+                conn.execute("UPDATE trials SET status='paused' WHERE id=?", (trial_id,))
+                self._audit(conn, trial_id, user_id, "enrollment.pause", {"hold_id": cur.lastrowid, "reason": reason, "paused_at": ts})
+                return self._hold_payload(conn, cur.lastrowid)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def resume_enrollment(self, user_id, trial_id, resolution_note):
+        """整改结束并补写处理说明后恢复入组，随机序列不重置、已占用编号不回收。"""
+        note = self._reason(resolution_note, "整改处理说明")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "paused":
+                    raise BusinessError("只有暂停中的试验可以恢复", 409, "invalid_status")
+                hold = conn.execute(
+                    "SELECT * FROM enrollment_holds WHERE trial_id=? AND resumed_at IS NULL ORDER BY id DESC LIMIT 1",
+                    (trial_id,),
+                ).fetchone()
+                if not hold:
+                    raise BusinessError("没有找到对应的暂停记录", 409, "hold_not_found")
+                ts = now()
+                conn.execute(
+                    "UPDATE enrollment_holds SET resolution_note=?,resumed_by=?,resumed_at=? WHERE id=?",
+                    (note, user_id, ts, hold["id"]),
+                )
+                conn.execute("UPDATE trials SET status='running' WHERE id=?", (trial_id,))
+                self._audit(conn, trial_id, user_id, "enrollment.resume", {"hold_id": hold["id"], "resolution_note": note, "resumed_at": ts})
+                return self._hold_payload(conn, hold["id"])
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _hold_row(row):
+        return {
+            "id": row["id"], "trial_id": row["trial_id"],
+            "reason": row["reason"], "paused_by": row["paused_by"], "paused_at": row["paused_at"],
+            "resolution_note": row["resolution_note"], "resumed_by": row["resumed_by"], "resumed_at": row["resumed_at"],
+            "active": row["resumed_at"] is None,
+        }
+
+    def _hold_payload(self, conn, hold_id):
+        return self._hold_row(conn.execute("SELECT * FROM enrollment_holds WHERE id=?", (hold_id,)).fetchone())
+
     def _stratum(self, conn, trial, factors, site_id):
         expected = json.loads(trial["strata_factors_json"])
         if set(factors) != set(expected):
@@ -255,8 +366,6 @@ class RandomizationStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 trial = self._trial(conn, trial_id)
-                if trial["status"] != "running":
-                    raise BusinessError("试验尚未开始或已经停止", 409, "trial_not_running")
                 existing = conn.execute(
                     "SELECT * FROM participants WHERE trial_id=? AND external_id=?", (trial_id, external_id)
                 ).fetchone()
@@ -265,6 +374,18 @@ class RandomizationStore:
                         raise BusinessError("不能在当前中心查看其他中心的受试者", 403, "site_isolation")
                     conn.commit()
                     return self._blinded_participant(conn, existing, actor, allow_arm=False, idempotent=True)
+                if trial["status"] == "paused":
+                    hold = conn.execute(
+                        "SELECT * FROM enrollment_holds WHERE trial_id=? AND resumed_at IS NULL ORDER BY id DESC LIMIT 1",
+                        (trial_id,),
+                    ).fetchone()
+                    raise BusinessError(
+                        "试验因安全信号已暂停入组，整改恢复前不能接收新受试者",
+                        409, "enrollment_paused",
+                        details=self._hold_row(hold) if hold else None,
+                    )
+                if trial["status"] != "running":
+                    raise BusinessError("试验尚未开始或已经停止", 409, "trial_not_running")
                 stratum = self._stratum(conn, trial, factors, actor["site_id"])
                 allocation = self._next_allocation(conn, trial, stratum)
                 allocation_code = hashlib.sha256(f"{trial_id}:{external_id}".encode()).hexdigest()[:12].upper()
@@ -296,6 +417,9 @@ class RandomizationStore:
             "external_id": participant["external_id"], "site_id": participant["site_id"],
             "allocation_code": participant["allocation_code"], "status": participant["status"],
             "created_at": participant["created_at"], "idempotent": idempotent,
+            "status_reason": participant["status_reason"],
+            "status_changed_at": participant["status_changed_at"],
+            "status_changed_by": participant["status_changed_by"],
         }
         if allow_arm:
             result["arm"] = conn.execute("SELECT arm FROM allocations WHERE id=?", (participant["allocation_id"],)).fetchone()["arm"]
@@ -323,6 +447,40 @@ class RandomizationStore:
                 "SELECT 1 FROM unblinding_requests WHERE participant_id=? AND status='approved'", (participant_id,)
             ).fetchone() is not None
             return self._blinded_participant(conn, row, actor, allow_arm=approved)
+
+    def set_participant_status(self, user_id, participant_id, new_status, reason):
+        """中心登记受试者完成或退出；随机编号保持占用、不回收。"""
+        reason = self._reason(reason, "状态变更原因", minimum=4)
+        if new_status not in ("completed", "withdrawn"):
+            raise BusinessError("受试者状态只能登记为完成或退出", 422, "invalid_status")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site"})
+                participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+                if not participant:
+                    raise BusinessError("受试者不存在", 404, "not_found")
+                if participant["site_id"] != actor["site_id"]:
+                    raise BusinessError("只能登记本中心受试者的完成或退出", 403, "site_isolation")
+                if participant["status"] != "enrolled":
+                    raise BusinessError(
+                        f"受试者当前状态为{participant['status']}，不能重复登记", 409, "status_locked"
+                    )
+                ts = now()
+                conn.execute(
+                    "UPDATE participants SET status=?,status_reason=?,status_changed_at=?,status_changed_by=? WHERE id=?",
+                    (new_status, reason, ts, user_id, participant_id),
+                )
+                self._audit(
+                    conn, participant["trial_id"], user_id, f"participant.{new_status}",
+                    {"participant_id": participant_id, "external_id": participant["external_id"],
+                     "site_id": actor["site_id"], "reason": reason, "changed_at": ts},
+                )
+                row = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+                return self._blinded_participant(conn, row, actor)
+            except Exception:
+                conn.rollback()
+                raise
 
     def request_unblinding(self, user_id, participant_id, reason):
         if len(reason.strip()) < 8:
@@ -375,6 +533,26 @@ class RandomizationStore:
                 conn.rollback()
                 raise
 
+    def list_unblinding_requests(self, user_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            rows = conn.execute(
+                """
+                SELECT r.*, p.site_id, p.external_id, p.trial_id
+                FROM unblinding_requests r JOIN participants p ON p.id=r.participant_id
+                ORDER BY r.id
+                """
+            ).fetchall()
+            if actor["role"] == "site":
+                rows = [r for r in rows if r["site_id"] == actor["site_id"]]
+            return [{
+                "id": r["id"], "trial_id": r["trial_id"], "participant_id": r["participant_id"],
+                "external_id": r["external_id"], "site_id": r["site_id"],
+                "requester_id": r["requester_id"], "reason": r["reason"], "status": r["status"],
+                "first_approver": r["first_approver"], "second_approver": r["second_approver"],
+                "created_at": r["created_at"], "decided_at": r["decided_at"],
+            } for r in rows]
+
     def trial_summary(self, user_id, trial_id):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
@@ -387,8 +565,15 @@ class RandomizationStore:
                 f"SELECT site_id,COUNT(*) AS count FROM participants WHERE trial_id=?" + where + " GROUP BY site_id", params
             ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+            holds = conn.execute(
+                "SELECT * FROM enrollment_holds WHERE trial_id=? ORDER BY id", (trial_id,)
+            ).fetchall()
+            active_hold = next((self._hold_row(h) for h in reversed(holds) if h["resumed_at"] is None), None)
             return {
-                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
+                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"],
+                          "strata_factors": json.loads(trial["strata_factors_json"])},
+                "enrollment_hold": active_hold,
+                "hold_history": [self._hold_row(h) for h in holds],
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
@@ -422,19 +607,30 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="protocol" and method=="POST":
                 d=self._body(); return self._send(200, store.update_protocol(user,trial_id,d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed")))
             if len(parts)==4 and parts[3]=="start" and method=="POST": return self._send(200, store.start_trial(user,trial_id))
+            if len(parts)==4 and parts[3]=="pause" and method=="POST":
+                d=self._body(); return self._send(200, store.pause_enrollment(user,trial_id,d.get("reason","")))
+            if len(parts)==4 and parts[3]=="resume" and method=="POST":
+                d=self._body(); return self._send(200, store.resume_enrollment(user,trial_id,d.get("resolution_note","")))
             if len(parts)==4 and parts[3]=="participants" and method=="GET": return self._send(200, {"items": store.list_participants(user,trial_id)})
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="status" and method=="POST":
+            d=self._body(); return self._send(200, store.set_participant_status(user,int(parts[2]),d.get("status",""),d.get("reason","")))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
+        if len(parts)==2 and parts==["api","unblinding-requests"] and method=="GET":
+            return self._send(200, {"items": store.list_unblinding_requests(user)})
         if len(parts)==4 and parts[:2]==["api","unblinding-requests"] and parts[3]=="approve" and method=="POST":
             return self._send(200, store.approve_unblinding(user,int(parts[2])))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status,{"error":{"code":exc.code,"message":exc.message}})
+        except BusinessError as exc:
+            payload={"error":{"code":exc.code,"message":exc.message}}
+            if exc.details is not None: payload["error"]["details"]=exc.details
+            self._send(exc.status,payload)
         except (ValueError,TypeError): self._send(400,{"error":{"code":"invalid_path","message":"路径参数格式错误"}})
         except Exception as exc: self._send(500,{"error":{"code":"internal_error","message":str(exc)}})
     def do_GET(self): self._handle("GET")
